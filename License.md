@@ -1,1 +1,1 @@
-http://wiki.st.com/stm32mpu/index.php/OpenSTLinux_licenses
+https://github.com/PRG-MPU-ALPHA/oe-manifest/wiki/OpenSTLinux-licenses
