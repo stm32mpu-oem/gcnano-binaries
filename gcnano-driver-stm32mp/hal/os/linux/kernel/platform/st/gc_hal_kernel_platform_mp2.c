@@ -2,7 +2,7 @@
 *
 *    The MIT License (MIT)
 *
-*    Copyright (c) 2014 - 2021 Vivante Corporation
+*    Copyright (c) 2014 - 2023 Vivante Corporation
 *
 *    Permission is hereby granted, free of charge, to any person obtaining a
 *    copy of this software and associated documentation files (the "Software"),
@@ -26,7 +26,7 @@
 *
 *    The GPL License (GPL)
 *
-*    Copyright (C) 2014 - 2021 Vivante Corporation
+*    Copyright (C) 2014 - 2023 Vivante Corporation
 *
 *    This program is free software; you can redistribute it and/or
 *    modify it under the terms of the GNU General Public License
@@ -68,8 +68,6 @@
 #include "gc_hal_kernel_allocator.h"
 #include "gc_hal_kernel_allocator_array.h"
 
-#define ST_GPU_AUTOSUSPEND_DELAY_MS              200
-
 #ifdef DEBUG
 #define DEBUG_LEVEL gcvLEVEL_WARNING
 #define DEBUG_ZONE  gcdZONE_ALL
@@ -78,9 +76,9 @@
 #define str(x) #x
 #endif
 
-#define REG_ALWAYS_ON
-
 struct st_priv {
+    gcsPLATFORM * platform;
+
     /*  Reset management */
     struct reset_control *rstc;
 
@@ -107,6 +105,8 @@ _AllocPriv(IN gcsPLATFORM * Platform)
     }
 
     stpriv = priv;
+    stpriv->platform = Platform;
+
     return 0;
 }
 
@@ -122,8 +122,28 @@ _FreePriv(IN gcsPLATFORM * Platform)
     return 0;
 }
 
+static int _reset(void)
+{
+    struct st_priv* priv = stpriv;
+    struct platform_device* pdev = stpriv->platform->device;
+    struct device *dev = &pdev->dev;
+
+    struct reset_control *rstc = priv->rstc;
+    int ret = 0;
+
+    if (!rstc)
+         goto end;
+
+    ret = reset_control_reset(rstc);
+    if (ret)
+        dev_err(dev, "galcore platform st: reset timeout\n");
+
+end:
+    return ret;
+}
+
 static int
-set_clock(IN gctBOOL Enable)
+set_clock(struct device *dev, IN gctBOOL Enable)
 {
     struct st_priv* priv = stpriv;
     int ret = 0;
@@ -147,13 +167,15 @@ set_clock(IN gctBOOL Enable)
 
         ret = clk_prepare_enable(priv->clk_3d_ref);
         if (ret) {
-            clk_disable_unprepare(priv->clk_3d_ahb);
             clk_disable_unprepare(priv->clk_3d_axi);
+            clk_disable_unprepare(priv->clk_3d_ahb);
             gckOS_Print("galcore platform st: failed to clock clk_3d_ref: %i\n",
                         ret);
             goto error;
         }
+        _reset();
     } else {
+        _reset();
         clk_disable_unprepare(priv->clk_3d_ahb);
         clk_disable_unprepare(priv->clk_3d_axi);
         clk_disable_unprepare(priv->clk_3d_ref);
@@ -162,6 +184,36 @@ set_clock(IN gctBOOL Enable)
 error:
     return ret;
 }
+
+static int
+set_power(struct device *dev, IN gctBOOL Enable)
+{
+    struct st_priv *priv = stpriv;
+    int ret = gcvSTATUS_OK;
+
+    if (!priv->supply) {
+        goto error;
+    }
+
+    if (Enable) {
+        ret = regulator_enable(priv->supply);
+        if (ret < 0) {
+            dev_err(dev, "failed to enable GPU power supply\n");
+            goto error;
+        }
+    } else {
+        ret = regulator_disable(priv->supply);
+        if (ret < 0) {
+            dev_err(dev, "failed to disable GPU power supply\n");
+            goto error;
+        }
+    }
+
+    return gcvSTATUS_OK;
+error:
+    return ret;
+}
+
 
 gceSTATUS
 _AdjustParam(IN gcsPLATFORM * Platform, OUT gcsMODULE_PARAMETERS *Args)
@@ -204,7 +256,18 @@ _AdjustParam(IN gcsPLATFORM * Platform, OUT gcsMODULE_PARAMETERS *Args)
         }
         Args->irqs[core] = irq;
         allocatorArray = allocatorArray_CMA_First;
+
+        Platform->flagBits |= gcvPLATFORM_FLAG_LIMIT_4G_ADDRESS;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24)
+        *Args->devices[0]->dma_mask = DMA_BIT_MASK(32);
+        Args->devices[0]->coherent_dma_mask = DMA_BIT_MASK(32);
+#else
+        *Args->devices[0]->dma_mask = DMA_32BIT_MASK;
+        Args->devices[0]->coherent_dma_mask = DMA_32BIT_MASK;
+#endif
+
     }
+
     return gcvSTATUS_OK;
 }
 
@@ -215,42 +278,25 @@ static const struct of_device_id gcnano_of_match[] = {
 MODULE_DEVICE_TABLE(of, gcnano_of_match);
 
 gceSTATUS
-_Reset(IN gcsPLATFORM * Platform, IN gctUINT32 DevIndex, IN gceCORE GPU);
-
-gceSTATUS
 _SetPower( IN gcsPLATFORM * Platform,
            IN gctUINT32 DevIndex,
            IN gceCORE GPU,
            IN gctBOOL Enable
         )
 {
-#ifndef REG_ALWAYS_ON
     struct device *dev = &Platform->device->dev;
-    struct st_priv *priv = stpriv;
-    int ret;
+    int ret = 0;
 
-    if (Enable) {
-        ret = regulator_enable(priv->supply);
-        if (ret < 0) {
-                dev_err(dev, "failed to enable GPU power supply\n");
-                goto error;
-        }
-    } else {
-        ret = regulator_disable(priv->supply);
-        if (ret < 0) {
-                dev_err(dev, "failed to disable GPU power supply\n");
-                goto error;
-        }
-    }
-
-    return gcvSTATUS_OK;
-
-error:
-    return ret;
+#ifdef CONFIG_PM
+    if (Enable)
+        pm_runtime_get_sync(dev);
+    else
+        pm_runtime_put_sync(dev);
 #else
-    return gcvSTATUS_OK;
+    ret = set_power(dev, Enable);
 #endif
 
+    return (ret < 0 ? gcvSTATUS_INVALID_REQUEST : gcvSTATUS_OK);
 }
 
 gceSTATUS
@@ -267,17 +313,20 @@ _GetPower(IN gcsPLATFORM * Platform)
 
     priv->supply = devm_regulator_get(dev, "gpu");
     if (IS_ERR(priv->supply)) {
-        ret = PTR_ERR(priv->supply);
-        dev_err(dev, "no GPU regulator");
-        ret_val = gcvSTATUS_CLOCK_ERROR;
-        goto error;
+        /* If no regulator this is likely a Power Domain management */
+        dev_warn(dev, "no GPU regulator");
+        priv->supply = NULL;
+    } else {
+        dev_warn(dev, "GPU regulator gotten");
     }
 
-    ret = regulator_enable(priv->supply);
-    if (ret < 0) {
-        dev_err(dev, "failed to enable GPU power supply\n");
-        ret_val = gcvSTATUS_CLOCK_ERROR;
-        goto error;
+    if (priv->supply) {
+       ret = regulator_enable(priv->supply);
+       if (ret < 0) {
+          dev_err(dev, "failed to enable GPU power supply\n");
+          ret_val = gcvSTATUS_CLOCK_ERROR;
+          goto error;
+       }
     }
 
     priv->clk_3d_axi = devm_clk_get(dev, "axi");
@@ -300,36 +349,33 @@ _GetPower(IN gcsPLATFORM * Platform)
         goto error;
     }
 
-    ret = set_clock(gcvTRUE);
+    ret = set_clock(dev, gcvTRUE);
+    if (ret) {
+        ret_val = gcvSTATUS_CLOCK_ERROR;
+        goto error;
+    }
+    /*
+     * Reset may fail but this fallthru to clock disabled and reg disabled
+     * that put system in good shape
+     */
+    _reset();
+
+    ret = set_clock(dev, gcvFALSE);
     if (ret) {
         ret_val = gcvSTATUS_CLOCK_ERROR;
         goto error;
     }
 
-    ret_val = _Reset(Platform, 0, gcvCORE_MAJOR);
-    ret = set_clock(gcvFALSE);
-    if (ret) {
-        ret_val = gcvSTATUS_CLOCK_ERROR;
-        goto error;
+    if (priv->supply) {
+        ret = regulator_disable(priv->supply);
+        if (ret < 0) {
+           dev_err(dev, "failed to disable GPU power supply\n");
+           ret_val = gcvSTATUS_INVALID_REQUEST;
+           goto error;
+        }
     }
-
-#ifndef REG_ALWAYS_ON
-    ret = regulator_disable(priv->supply);
-    if (ret < 0) {
-        dev_err(dev, "failed to disable GPU power supply\n");
-        ret_val = gcvSTATUS_CLOCK_ERROR;
-        goto error;
-    } else {
-        dev_info(dev, "GPU power supply disable OK\n");
-    }
-#endif
-
-    if (ret_val != gcvSTATUS_OK)
-        goto error;
 
 #ifdef CONFIG_PM
-    pm_runtime_set_autosuspend_delay(dev, ST_GPU_AUTOSUSPEND_DELAY_MS);
-    pm_runtime_use_autosuspend(dev);
     pm_runtime_enable(dev);
 #endif
 
@@ -342,12 +388,8 @@ _PutPower(IN gcsPLATFORM * Platform)
 {
     struct st_priv *priv = stpriv;
     struct device *dev = &Platform->device->dev;
-#ifdef REG_ALWAYS_ON
-    int ret;
-#endif
 
 #ifdef CONFIG_PM
-    pm_runtime_dont_use_autosuspend(dev);
     pm_runtime_disable(dev);
 #endif
 
@@ -367,12 +409,6 @@ _PutPower(IN gcsPLATFORM * Platform)
         priv->clk_3d_ref = NULL;
     }
 
-#ifdef REG_ALWAYS_ON
-    ret = regulator_disable(priv->supply);
-    if (ret < 0)
-        dev_err(dev, "failed to disable GPU power supply\n");
-#endif
-
     if (priv->supply) {
         devm_regulator_put(priv->supply);
         priv->supply = NULL;
@@ -384,81 +420,68 @@ _PutPower(IN gcsPLATFORM * Platform)
 #ifdef CONFIG_PM
 static int st_gpu_runtime_suspend(struct device *dev)
 {
-    return set_clock(gcvFALSE);
+    int ret = 0;
+
+    ret = set_clock(dev, gcvFALSE);
+    if (ret < 0)
+        set_power(dev, gcvFALSE);
+    else
+        ret = set_power(dev, gcvFALSE);
+
+    return ret;
 }
 
 static int st_gpu_runtime_resume(struct device *dev)
 {
-    return set_clock(gcvTRUE);
+    int ret = 0;
+
+    ret = set_power(dev, gcvTRUE);
+    if (ret < 0)
+        goto error;
+
+    ret = set_clock(dev, gcvTRUE);
+error:
+    return ret;
 }
 
 static struct dev_pm_ops gpu_pm_ops;
 #endif
 
 gceSTATUS
-_SetClock(IN gcsPLATFORM * Platform, IN gctUINT32 DevIndex, IN gceCORE GPU, IN gctBOOL Enable)
+_SetClock(IN gcsPLATFORM * Platform, IN gctUINT32 DevIndex,IN gceCORE GPU, IN gctBOOL Enable)
 {
-#ifdef CONFIG_PM
     struct device *dev = &Platform->device->dev;
     int ret = 0;
 
+#ifdef CONFIG_PM
     if (Enable) {
-        ret = pm_runtime_get_sync(dev);
-        if (ret < 0) {
-            pm_runtime_mark_last_busy(dev);
-            ret = pm_runtime_put_autosuspend(dev);
-        }
+        /* returns 0 on success,
+         * 1 if the device's runtime PM status was already 'active'
+         */
+        ret = pm_runtime_resume(dev);
     }
     else {
-        pm_runtime_mark_last_busy(dev);
-        ret = pm_runtime_put_autosuspend(dev);
+        ret = pm_runtime_idle(dev);
+        if ( (ret == -EAGAIN) || (ret == -EBUSY)) {
+            ret = 0;
+        }
     }
+#else
+    ret = set_clock(dev, Enable);
+#endif
 
     return (ret < 0 ? gcvSTATUS_INVALID_REQUEST : gcvSTATUS_OK);
-#else
-    int ret;
-    ret = set_clock(Enable);
-
-    return (ret ? gcvSTATUS_INVALID_REQUEST : gcvSTATUS_OK);
-#endif
 }
 
 gceSTATUS
 _Reset(IN gcsPLATFORM * Platform, IN gctUINT32 DevIndex, IN gceCORE GPU)
 {
-    struct st_priv* priv = stpriv;
-    struct reset_control *rstc = priv->rstc;
-    int timeout = 10;
     int ret = 0;
 
-    /*
-     *  In order to reset the GPU the user has to write this bit to '1', and
-     *  read the GPURST bit until it is read to'0'. This bit is cleared by
-     *  hardware.
-     */
     if (GPU != gcvCORE_MAJOR)
         goto end;
 
-    if (!rstc)
-         goto end;
-
-    ret = reset_control_assert(rstc);
-    if (ret) {
-        gckOS_Print("galcore platform st: reset error(%d)\n", ret);
-        goto end;
-    }
-
-    do {
-        ret = reset_control_status(rstc);
-        if (ret == 0)
-             break;
-
-        udelay(2);
-    } while (timeout--);
-
-    if (timeout <= 0)
-        gckOS_Print("galcore platform st: reset timeout\n");
-
+    ret = _reset();
 end:
     return (ret ? gcvSTATUS_INVALID_REQUEST : gcvSTATUS_OK);
 }
